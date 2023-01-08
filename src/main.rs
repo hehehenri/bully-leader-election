@@ -1,8 +1,9 @@
 use std::{collections::HashMap, net::SocketAddr, sync::{Arc, Mutex}};
 
-use axum::{Router, Server, routing::get, extract::{Path, State as ReqState}};
+use axum::{Router, Server, routing::get, extract::{Path, State as ReqState}, Extension};
 use clap::Parser;
 use hyper::{Method, StatusCode};
+use reqwest::Response;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -24,7 +25,8 @@ enum State {
 struct AppState<'a> {
     process: Process,
     state: State,
-    processes: HashMap<usize, &'a str>
+    processes: HashMap<usize, &'a str>,
+    leader: Option<Process>
 }
 
 impl<'a> AppState<'a> {
@@ -58,7 +60,7 @@ async fn main() {
         processes
     };
 
-    send_election_message(&mut state).await;
+    broadcast_election(&mut state).await;
 
     let app = Router::new()
         .route("/election", get(handle_election_message))
@@ -85,7 +87,7 @@ async fn main() {
         // consider the sender as the leader
 }
 
-async fn send_election_message<'a>(app: &mut AppState<'a>) {
+async fn broadcast_election<'a>(app: &mut AppState<'a>) {
     let process = app.process;
     let processes = &app.processes.clone();
 
@@ -95,28 +97,28 @@ async fn send_election_message<'a>(app: &mut AppState<'a>) {
         return;
     }
 
-    let mut should_become_leader = true;
-
     for (pid, addr) in processes.iter() {
         if *pid <= process.pid {
             continue;
         }
 
-        let response = reqwest::Client::new()
-            .post(format!("{}/election", addr))
-            .send()
-            .await;
+        let response = send_election_message(addr).await;
 
+        // If received a response, no other messages must be sent
         if let Ok(response) = response {
-            if response.status() == StatusCode::OK {
-                should_become_leader = false;
-            }
+            return;
         }
     }
 
-    if should_become_leader {
-        become_leader(app).await;
-    }
+    // If received no response, the current process must be the leader
+    become_leader(app).await;
+}
+
+async fn send_election_message(process_addr: &str) -> Result<Response, reqwest::Error> {
+    reqwest::Client::new()
+        .post(format!("{}/election", process_addr))
+        .send()
+        .await
 }
 
 async fn become_leader<'a>(app: &mut AppState<'a>) {
@@ -146,9 +148,28 @@ fn get_higher_pid(processes: &HashMap<usize, &str>) -> usize {
     *pid
 }
 
-async fn handle_election_message<'a>(ReqState(state): ReqState<Arc<Mutex<AppState<'a>>>>) {
+async fn handle_election_message<'a>(Extension(state): Extension<Arc<Mutex<AppState<'a>>>>) {
+    let mut app = state.try_lock().unwrap();
+
+    broadcast_election(&mut app).await
 }
 
-async fn handle_victory_message<'a>(Path(pid): Path<String>, ReqState(state): ReqState<Arc<Mutex<AppState<'a>>>>) {
-    todo!()
+async fn handle_victory_message<'a>(Path(pid): Path<usize>, Extension(state): Extension<Arc<Mutex<AppState<'a>>>>) {
+    let mut app = state.try_lock().unwrap();
+
+    let leader = Process {
+        pid,
+        addr: state
+            .try_lock()
+            .unwrap()
+            .processes
+            .get(&pid)
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+
+    app.leader = Some(leader);
+
+    println!("PID={} is the leader now. Respect him!", pid)
 }
