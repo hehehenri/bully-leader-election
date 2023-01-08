@@ -1,7 +1,8 @@
-use std::{collections::HashMap, env, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::{Arc, Mutex}};
 
-use axum::{Router, Server, routing::{MethodRouter, get}, extract::{Path, State}};
-use clap::{Arg, Parser};
+use axum::{Router, Server, routing::get, extract::{Path, State as ReqState}};
+use clap::Parser;
+use hyper::{Method, StatusCode};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -14,8 +15,22 @@ struct Process {
     addr: SocketAddr
 }
 
-struct AppState {
-    process: Process
+enum State {
+    Leader,
+    Candiadte,
+    Follower,
+}
+
+struct AppState<'a> {
+    process: Process,
+    state: State,
+    processes: HashMap<usize, &'a str>
+}
+
+impl<'a> AppState<'a> {
+    pub fn set_state(&mut self, state: State) {
+        self.state = state
+    }
 }
 
 #[tokio::main]
@@ -37,14 +52,18 @@ async fn main() {
         addr: current_process_addr.parse().expect("failed to parse process addr")
     };
 
-    let state = AppState {
-        process: current_process
+    let mut state = AppState {
+        process: current_process,
+        state: State::Candiadte,
+        processes
     };
+
+    send_election_message(&mut state).await;
 
     let app = Router::new()
         .route("/election", get(handle_election_message))
         .route("/victory/:pid", get(handle_victory_message))
-        .with_state(Arc::new(state));
+        .with_state(Arc::new(Mutex::new(state)));
 
     Server::bind(&current_process.addr)
         .serve(app.into_make_service())
@@ -66,10 +85,70 @@ async fn main() {
         // consider the sender as the leader
 }
 
-async fn handle_election_message(State(state): State<Arc<AppState>>) {
-    todo!()
+async fn send_election_message<'a>(app: &mut AppState<'a>) {
+    let process = app.process;
+    let processes = &app.processes.clone();
+
+    if process.pid == get_higher_pid(processes) {
+        become_leader(app).await;
+
+        return;
+    }
+
+    let mut should_become_leader = true;
+
+    for (pid, addr) in processes.iter() {
+        if *pid <= process.pid {
+            continue;
+        }
+
+        let response = reqwest::Client::new()
+            .post(format!("{}/election", addr))
+            .send()
+            .await;
+
+        if let Ok(response) = response {
+            if response.status() == StatusCode::OK {
+                should_become_leader = false;
+            }
+        }
+    }
+
+    if should_become_leader {
+        become_leader(app).await;
+    }
 }
 
-async fn handle_victory_message(Path(pid): Path<String>, State(state): State<Arc<AppState>>) {
+async fn become_leader<'a>(app: &mut AppState<'a>) {
+    send_victory_mesasge(app.process, &app.processes).await;
+
+    app.set_state(State::Leader);
+}
+
+async fn send_victory_mesasge(process: Process, processes: &HashMap<usize, &str>) {
+    for (pid, addr) in processes.iter() {
+        if *pid == process.pid {
+            continue;
+        }
+
+        let _ = reqwest::get(format!("{}/victory/{}", addr, process.pid))
+            .await
+            .expect("falied to send victory message");
+    }
+}
+
+fn get_higher_pid(processes: &HashMap<usize, &str>) -> usize {
+    let (pid, _) = processes
+        .iter()
+        .max_by_key(|(pid, _)| *pid)
+        .unwrap();
+
+    *pid
+}
+
+async fn handle_election_message<'a>(ReqState(state): ReqState<Arc<Mutex<AppState<'a>>>>) {
+}
+
+async fn handle_victory_message<'a>(Path(pid): Path<String>, ReqState(state): ReqState<Arc<Mutex<AppState<'a>>>>) {
     todo!()
 }
