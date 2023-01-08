@@ -2,7 +2,20 @@
 name = "bully-leader-election"
 version = "0.1.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+authors = ["henri borges"]
 
 [dependencies]
+axum = "0.6.1"
+tower = "0.4.13"
+
+[dependencies.clap]
+version = "4.0.32"
+features = ["derive"]
+
+[dependencies.hyper]
+version = "0.14.23"
+features = ["full"]
+
+[dependencies.tokio]
+version = "1.24.1"
+features = ["full"]
