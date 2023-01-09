@@ -1,9 +1,10 @@
-use std::{collections::HashMap, net::SocketAddr, sync::{Arc, Mutex}};
-
-use axum::{Router, Server, routing::get, extract::{Path, State as ReqState}, Extension};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use axum::{Router, Server, routing::get, extract::{Path, State as ReqState}, Extension, handler::Handler};
+use axum_macros::debug_handler;
 use clap::Parser;
 use hyper::{Method, StatusCode};
 use reqwest::Response;
+use tokio::sync::Mutex;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -16,20 +17,22 @@ struct Process {
     addr: SocketAddr
 }
 
+#[derive(Clone)]
 enum State {
     Leader,
     Candiadte,
     Follower,
 }
 
-struct AppState<'a> {
+#[derive(Clone)]
+struct AppState {
     process: Process,
     state: State,
-    processes: HashMap<usize, &'a str>,
+    processes: HashMap<usize, String>,
     leader: Option<Process>
 }
 
-impl<'a> AppState<'a> {
+impl AppState {
     pub fn set_state(&mut self, state: State) {
         self.state = state
     }
@@ -37,17 +40,17 @@ impl<'a> AppState<'a> {
 
 #[tokio::main]
 async fn main() {
-    let processes: HashMap<usize, &str> = HashMap::from([
-        (0, "127.0.0.1:3000"),
-        (1, "127.0.0.1:3001"),
-        (2, "127.0.0.1:3002"),
-        (3, "127.0.0.1:3003"),
-        (4, "127.0.0.1:3004"),
+    let processes = HashMap::from([
+        (0, String::from("127.0.0.1:3000")),
+        (1, String::from("127.0.0.1:3001")),
+        (2, String::from("127.0.0.1:3002")),
+        (3, String::from("127.0.0.1:3003")),
+        (4, String::from("127.0.0.1:3004")),
     ]);
 
     let args = Args::parse();
 
-    let current_process_addr = *processes.get(&args.pid).expect("the given pid is invalid");
+    let current_process_addr = processes.get(&args.pid).expect("the given pid is invalid");
 
     let current_process = Process {
         pid: args.pid,
@@ -57,55 +60,44 @@ async fn main() {
     let mut state = AppState {
         process: current_process,
         state: State::Candiadte,
-        processes
+        processes,
+        leader: None
     };
 
     broadcast_election(&mut state).await;
 
+    let app = Arc::new(Mutex::new(state));
+
     let app = Router::new()
         .route("/election", get(handle_election_message))
-        .route("/victory/:pid", get(handle_victory_message))
-        .with_state(Arc::new(Mutex::new(state)));
+        .route("/victory/:pid", get({
+            move |path| handle_victory_message(path, Arc::clone(&app))
+        }));
 
     Server::bind(&current_process.addr)
         .serve(app.into_make_service())
         .await
         .unwrap();
-
-    // send election message to processes with pid higher than itself
-    // if received no ok response
-        // broadcast victory message
-
-    // if received response is from process with pid higher
-        // wait for victory message
-
-
-    // receives election message from process with pid smaller
-        // start election from the beginning
-
-    // receives victory message
-        // consider the sender as the leader
 }
 
-async fn broadcast_election<'a>(app: &mut AppState<'a>) {
-    let process = app.process;
-    let processes = &app.processes.clone();
+async fn broadcast_election(app: &mut AppState) {
+    println!("PID={} started an election.", app.process.pid);
 
-    if process.pid == get_higher_pid(processes) {
+    if app.process.pid == get_higher_pid(&app.processes) {
         become_leader(app).await;
 
         return;
     }
 
-    for (pid, addr) in processes.iter() {
-        if *pid <= process.pid {
+    for (pid, addr) in app.processes.iter() {
+        if *pid <= app.process.pid {
             continue;
         }
 
         let response = send_election_message(addr).await;
 
         // If received a response, no other messages must be sent
-        if let Ok(response) = response {
+        if response.is_ok() {
             return;
         }
     }
@@ -121,13 +113,15 @@ async fn send_election_message(process_addr: &str) -> Result<Response, reqwest::
         .await
 }
 
-async fn become_leader<'a>(app: &mut AppState<'a>) {
+async fn become_leader(app: &mut AppState) {
     send_victory_mesasge(app.process, &app.processes).await;
 
     app.set_state(State::Leader);
+
+    println!("PID={} became the leader.", app.process.pid)
 }
 
-async fn send_victory_mesasge(process: Process, processes: &HashMap<usize, &str>) {
+async fn send_victory_mesasge(process: Process, processes: &HashMap<usize, String>) {
     for (pid, addr) in processes.iter() {
         if *pid == process.pid {
             continue;
@@ -139,7 +133,7 @@ async fn send_victory_mesasge(process: Process, processes: &HashMap<usize, &str>
     }
 }
 
-fn get_higher_pid(processes: &HashMap<usize, &str>) -> usize {
+fn get_higher_pid(processes: &HashMap<usize, String>) -> usize {
     let (pid, _) = processes
         .iter()
         .max_by_key(|(pid, _)| *pid)
@@ -148,13 +142,14 @@ fn get_higher_pid(processes: &HashMap<usize, &str>) -> usize {
     *pid
 }
 
-async fn handle_election_message<'a>(Extension(state): Extension<Arc<Mutex<AppState<'a>>>>) {
-    let mut app = state.try_lock().unwrap();
+#[debug_handler]
+async fn handle_election_message(Extension(state): Extension<Arc<Mutex<AppState>>>) {
+    let mut state = state.try_lock().unwrap();
 
-    broadcast_election(&mut app).await
+    broadcast_election(&mut state).await;
 }
 
-async fn handle_victory_message<'a>(Path(pid): Path<usize>, Extension(state): Extension<Arc<Mutex<AppState<'a>>>>) {
+async fn handle_victory_message(Path(pid): Path<usize>, state: Arc<Mutex<AppState>>) {
     let mut app = state.try_lock().unwrap();
 
     let leader = Process {
